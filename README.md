@@ -69,10 +69,27 @@ Open question: how old the "older machines" are (decides how plain the visitor H
   listen address (all cards / one card / this PC only). Host names: background reverse DNS, cached 6 h, shown in
   Connections + Visitors and as a tooltip in the Log.
 
+## Review fixes (2026-11-17, external review "almost good")
+
+- Wrong passwords are counted on every page (public ones too), once per distinct credential (a browser resending a
+  stale password isn't a new guess); unknown user names are hashed against a decoy (no name probing by timing);
+  hashing is async with a short queue (503 when full); an address over its guess budget doesn't get hashing at all.
+- Accounts + login cache are one state object swapped atomically: a check in flight during a password change can't
+  re-cache the old password.
+- ZIP: a file that shrinks, grows, changes or becomes unreadable mid-archive aborts the download (no zero padding);
+  at most 4 ZIPs at once, 2 per address; enumeration stops at the entry limit instead of reading huge folders whole.
+- Uploads: 200 only when every file was saved; broken/incomplete multipart = 400, server write failure = 500,
+  disk full = 507; at most 1000 files per request; free-space check every 8 MB.
+- HEAD requests are not downloads (no stats, no log). Unhandled errors become a 500 (or an aborted response) and
+  are logged, never counted as successful transfers.
+- Folder pages stop at 10,000 rows (the filter searches everything). Stats are snapshotted under the lock and written
+  on a background thread. Login, DNS and bot-guard caches are pruned every minute.
+
 ## Testing
 
-`tests/Harness` = 136 end-to-end checks against a real FileServer on 127.0.0.1 (raw TCP requests, because HttpClient
+`tests/Harness` = 148 end-to-end checks against a real FileServer on 127.0.0.1 (raw TCP requests, because HttpClient
 normalizes `..` and can't test traversal): downloads/resume, ~25 traversal/ADS/junction attacks, log/progress/kick/ban,
 sign-in/permissions/uploads/drop box/auto-ban, bot guard + CSRF + header tricks, ZIP (byte-identical + tar + ZIP64),
-host names, adapters, public IP. Run: `cd tests\Harness && dotnet run` (needs Internet for the DNS/public-IP checks;
-creates and deletes its own temp folders). `dotnet run -- ico <path>` regenerates `src\app.ico`.
+every review finding (R1-R7). `cd tests\Harness && dotnet run` = offline suite; add `-- --online` for reverse DNS and
+public-IP checks. Exit code 1 on any failure; statistics stay in memory (never touches the real stats.json); temp
+folders are removed in a finally. `dotnet run -- ico <path>` regenerates the app icon.

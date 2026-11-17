@@ -156,7 +156,17 @@ public sealed class StatsData
         return new();
     }
 
-    public void Save()
+    public string ToJson() => JsonSerializer.Serialize(this, Json);
+
+    public static void WriteFile(string json)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(PathOnDisk)!);
+        var tmp = PathOnDisk + ".tmp";
+        File.WriteAllText(tmp, json);
+        File.Move(tmp, PathOnDisk, true);
+    }
+
+    public void Prune()
     {
         // Internet scanners hit forwarded ports from thousands of addresses; keep the file bounded.
         if (Visitors.Count > 5000)
@@ -165,10 +175,6 @@ public sealed class StatsData
         if (Files.Count > 5000)
             foreach (var k in Files.OrderBy(v => v.Value.Last).Take(Files.Count - 5000).Select(v => v.Key).ToList())
                 Files.Remove(k);
-        Directory.CreateDirectory(Path.GetDirectoryName(PathOnDisk)!);
-        var tmp = PathOnDisk + ".tmp";
-        File.WriteAllText(tmp, JsonSerializer.Serialize(this, Json));
-        File.Move(tmp, PathOnDisk, true);
     }
 }
 
@@ -199,9 +205,13 @@ public sealed class Traffic
     volatile BanRule[] bans = [];
     StatsData stats;
 
-    public Traffic()
+    readonly bool persist;
+
+    /// <param name="persist">false = statistics live in memory only (tests): stats.json is neither read nor written.</param>
+    public Traffic(bool persist = true)
     {
-        stats = StatsData.Load();
+        this.persist = persist;
+        stats = persist ? StatsData.Load() : new StatsData();
         totalIn = stats.TotalIn;
         totalOut = stats.TotalOut;
     }
@@ -317,6 +327,7 @@ public sealed class Traffic
         Conn? conn, TimeSpan took)
     {
         if (info.Upload) return;   // the upload handler logs each file itself
+        if (info.File && string.Equals(method, "HEAD", StringComparison.OrdinalIgnoreCase)) return;   // headers only, nothing was downloaded
         if (info.LogName != null) path = info.LogName;
         if (info.File)
         {
@@ -428,14 +439,27 @@ public sealed class Traffic
         SaveStats();
     }
 
-    public void SaveStats()
+    readonly object statsFileLock = new();
+    Task statsWrite = Task.CompletedTask;
+
+    /// <summary>
+    /// Snapshot under the lock (in memory, quick), write the file on a background thread so neither the window
+    /// nor request bookkeeping waits for the disk. <paramref name="wait"/> = on exit, finish before returning.
+    /// </summary>
+    public void SaveStats(bool wait = false)
     {
+        if (!persist) return;
+        string json;
         lock (statsLock)
         {
             stats.TotalIn = TotalIn;
             stats.TotalOut = TotalOut;
-            try { stats.Save(); } catch { }
+            stats.Prune();
+            json = stats.ToJson();
         }
+        lock (statsFileLock)
+            statsWrite = statsWrite.ContinueWith(_ => { try { StatsData.WriteFile(json); } catch { } }, TaskScheduler.Default);
+        if (wait) statsWrite.Wait(5000);
     }
 }
 

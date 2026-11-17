@@ -14,10 +14,11 @@ if (args.Length > 0 && args[0] == "ico")
     int off = 6 + 16 * sizes.Length;
     for (int i = 0; i < sizes.Length; i++) { w.Write((byte)(sizes[i] >= 256 ? 0 : sizes[i])); w.Write((byte)(sizes[i] >= 256 ? 0 : sizes[i])); w.Write((byte)0); w.Write((byte)0); w.Write((short)1); w.Write((short)32); w.Write(pngs[i].Length); w.Write(off); off += pngs[i].Length; }
     foreach (var p in pngs) w.Write(p);
-    Console.WriteLine("ico written"); return;
+    Console.WriteLine("ico written"); return 0;
 }
 
-// 2) server tests
+// 2) server tests (network-dependent checks only with --online)
+bool online = args.Contains("--online");
 var root = Path.Combine(Path.GetTempPath(), "mhfs_test_" + Guid.NewGuid().ToString("N")[..6]);
 var share = Path.Combine(root, "share"); var outside = Path.Combine(root, "outside");
 Directory.CreateDirectory(Path.Combine(share, "sub")); Directory.CreateDirectory(outside);
@@ -33,7 +34,7 @@ void Junction(string link, string target) => Process.Start(new ProcessStartInfo(
 Junction(Path.Combine(share, "link_out"), outside);
 Junction(Path.Combine(share, "link_in"), Path.Combine(share, "sub"));
 
-var traffic = new Traffic();
+var traffic = new Traffic(persist: false);
 var auth = new Authenticator();
 var srv = new FileServer(AppIcon.Png(32), traffic, auth);
 srv.SetItems([new SharedItem { Name = "Share", Path = share, IsFolder = true }, new SharedItem { Name = "single.txt", Path = Path.Combine(root, "single.txt") }]);
@@ -41,9 +42,11 @@ int port = 18080;
 await srv.StartAsync(port, IPAddress.Loopback);
 
 int fails = 0;
+try
+{
 (int code, Dictionary<string, string> h, byte[] body) Raw(string method, string target, string extra = "")
 {
-    using var c = new TcpClient("127.0.0.1", port); var s = c.GetStream();
+    using var c = new TcpClient("127.0.0.1", port) { ReceiveTimeout = 60000, SendTimeout = 60000 }; var s = c.GetStream();
     var req = $"{method} {target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n{extra}\r\n";
     s.Write(Encoding.UTF8.GetBytes(req));
     var ms = new MemoryStream(); s.CopyTo(ms); var all = ms.ToArray();
@@ -113,7 +116,7 @@ Check("partial range is not a full download", !logs.Any(l => l.Text.StartsWith("
 
 // live connection: slow reader on a 64 MB file -> progress, status, then kick
 {
-    using var c = new TcpClient("127.0.0.1", port) { ReceiveBufferSize = 8192 };
+    using var c = new TcpClient("127.0.0.1", port) { ReceiveBufferSize = 8192, ReceiveTimeout = 60000, SendTimeout = 60000 };
     var st = c.GetStream();
     st.Write(Encoding.ASCII.GetBytes("GET /Share/huge.bin HTTP/1.1\r\nHost: x\r\n\r\n"));
     var buf = new byte[65536]; long got = 0;
@@ -137,7 +140,7 @@ Check("partial range is not a full download", !logs.Any(l => l.Text.StartsWith("
 }
 // resume log
 {
-    using var c = new TcpClient("127.0.0.1", port); var st = c.GetStream();
+    using var c = new TcpClient("127.0.0.1", port) { ReceiveTimeout = 60000, SendTimeout = 60000 }; var st = c.GetStream();
     st.Write(Encoding.ASCII.GetBytes("GET /Share/huge.bin HTTP/1.1\r\nHost: x\r\nRange: bytes=33554432-\r\nConnection: close\r\n\r\n"));
     var buf = new byte[65536]; long got = 0; int n; while ((n = st.Read(buf)) > 0) got += n;
     Thread.Sleep(200); logs = Logs();
@@ -200,7 +203,7 @@ r = Raw("GET", "/?login=%2F"); Check("anon login -> 401", r.code == 401);
     }
     W($"--{bnd}--\r\n");
     var payload = ms.ToArray();
-    using var c = new TcpClient("127.0.0.1", port); var st = c.GetStream();
+    using var c = new TcpClient("127.0.0.1", port) { ReceiveTimeout = 60000, SendTimeout = 60000 }; var st = c.GetStream();
     st.Write(Encoding.UTF8.GetBytes($"POST {target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Type: multipart/form-data; boundary={bnd}\r\nContent-Length: {payload.Length}\r\n{extra}\r\n"));
     try { st.Write(payload); } catch { }
     var o = new MemoryStream(); try { st.CopyTo(o); } catch { }
@@ -222,7 +225,7 @@ r = Post("/Share/", "", ("up.txt", T("U2")));
 Check("no overwrite -> up (2).txt", File.ReadAllText(Path.Combine(share, "up.txt")) == "U1" && File.ReadAllText(Path.Combine(share, "up (2).txt")) == "U2" && B(r.body).Contains("Saved as up (2).txt"));
 r = Post("/Share/", "", ("..\\..\\evil.txt", T("E")), ("../../evil2.txt", T("E2")), ("CON.txt", T("C")), ("a:b.txt", T("ab")));
 Check("path tricks stay inside", File.Exists(Path.Combine(share, "evil.txt")) && File.Exists(Path.Combine(share, "evil2.txt")) && !File.Exists(Path.Combine(root, "evil.txt")) && !File.Exists(Path.Combine(root, "evil2.txt")) && File.Exists(Path.Combine(share, "_CON.txt")) && File.Exists(Path.Combine(share, "ab.txt")), string.Join(",", Directory.GetFiles(share).Select(Path.GetFileName)));
-Check("upload empty name skipped", Post("/Share/", "", ("", T("zzz"))).code == 200);
+Check("upload with no file -> 400", Post("/Share/", "", ("", T("zzz"))).code == 400);
 r = Post("/Share/sub/", "", ("insub.txt", T("S")));
 Check("upload into subfolder", r.code == 200 && File.Exists(Path.Combine(share, "sub", "insub.txt")));
 Thread.Sleep(100); logs = Logs();
@@ -251,7 +254,7 @@ Check("20 MB upload intact", r.code == 200 && File.ReadAllBytes(Path.Combine(sha
 // interrupted upload: promise 10 MB, send 1 MB, hang up
 {
     var bnd = "----cut";
-    using var c = new TcpClient("127.0.0.1", port); var st = c.GetStream();
+    using var c = new TcpClient("127.0.0.1", port) { ReceiveTimeout = 60000, SendTimeout = 60000 }; var st = c.GetStream();
     st.Write(T($"POST /Share/ HTTP/1.1\r\nHost: x\r\nContent-Type: multipart/form-data; boundary={bnd}\r\nContent-Length: 10485760\r\n\r\n--{bnd}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"cut.bin\"\r\n\r\n"));
     st.Write(new byte[1 << 20]);
     Thread.Sleep(300);
@@ -268,7 +271,7 @@ srv.MinFreeBytes = 1L << 30;
 var a2 = new Authenticator(); string? banned = null; a2.AutoBan += ip => banned = ip;
 var delays = Enumerable.Range(0, 10).Select(_ => a2.Fail("203.0.113.9")).ToList();
 Check("auto-ban after 10 wrong passwords", banned == "203.0.113.9" && delays[0] == TimeSpan.Zero && delays[2] == TimeSpan.FromSeconds(1) && delays[9] == TimeSpan.FromSeconds(5));
-banned = null; for (int k = 0; k < 12; k++) a2.Fail("127.0.0.1");
+banned = null; for (int k = 0; k < 12; k++) a2.Fail("127.0.0.1", neverBan: true);
 Check("loopback never auto-banned", banned == null);
 
 auth.SetAccounts([]);
@@ -322,7 +325,7 @@ g.Burst = 150; g.RequestsPerSecond = 30; g.Forget("127.0.0.1");
 
 g.MaxConnectionsPerAddress = 5;
 var held = new List<TcpClient>();
-for (int k = 0; k < 5; k++) { var c = new TcpClient("127.0.0.1", port); held.Add(c); }
+for (int k = 0; k < 5; k++) { var c = new TcpClient("127.0.0.1", port) { ReceiveTimeout = 60000, SendTimeout = 60000 }; held.Add(c); }
 Thread.Sleep(300);
 bool sixthRefused;
 try { var rr = Raw("GET", "/"); sixthRefused = false; } catch { sixthRefused = true; }
@@ -386,14 +389,122 @@ using (var za = new System.IO.Compression.ZipArchive(new MemoryStream(r.body)))
     string got = e == null ? "missing" : new StreamReader(e.Open()).ReadToEnd();
     Check("zip64: 66,000 entries readable", za.Entries.Count == 66000 && got == "x5000", $"{za.Entries.Count} {got}");
 }
+r = Raw("GET", "/Many/"); body = B(r.body);
+Check("huge folder page is capped at 10,000 rows", r.code == 200 && body.Contains("very large") && System.Text.RegularExpressions.Regex.Matches(body, "<tr>").Count <= 10_001, r.code.ToString());
+r = Raw("GET", "/Many/?q=f65999"); Check("filter still finds entries past the cap", B(r.body).Contains("f65999.txt"));
 
 var hn = new HostNames();
-hn.Get("127.0.0.1"); hn.Get("8.8.8.8");
-for (int k = 0; k < 50 && (hn.Get("127.0.0.1") == null || hn.Get("8.8.8.8") == null); k++) Thread.Sleep(100);
-Check("host names: loopback + reverse DNS", hn.Get("127.0.0.1") == "this PC" && (hn.Get("8.8.8.8") ?? "").Contains("google"), $"{hn.Get("127.0.0.1")} / {hn.Get("8.8.8.8")}");
+hn.Get("127.0.0.1");
+for (int k = 0; k < 50 && hn.Get("127.0.0.1") == null; k++) Thread.Sleep(100);
+Check("host names: loopback", hn.Get("127.0.0.1") == "this PC", hn.Get("127.0.0.1") ?? "null");
+if (online)
+{
+    hn.Get("8.8.8.8");
+    for (int k = 0; k < 50 && hn.Get("8.8.8.8") == null; k++) Thread.Sleep(100);
+    Check("host names: reverse DNS (online)", (hn.Get("8.8.8.8") ?? "").Contains("google"), hn.Get("8.8.8.8") ?? "null");
+}
+else Console.WriteLine("SKIP  reverse DNS + public IP (run with --online)");
 Check("adapters listed", Network.Adapters().Count > 0 && Network.Adapters().All(a => IPAddress.TryParse(a.Address, out _)), string.Join(",", Network.Adapters().Select(a => a.Name + "=" + a.Address)));
-var pub = Network.PublicIPv4Async().GetAwaiter().GetResult();
-Check("public IPv4 found", pub != null && !Guard.IsPrivate(IPAddress.Parse(pub)), pub ?? "null");
+if (online)
+{
+    var pub = Network.PublicIPv4Async().GetAwaiter().GetResult();
+    Check("public IPv4 found (online)", pub != null && !Guard.IsPrivate(IPAddress.Parse(pub)), pub ?? "null");
+}
+Logs();
+
+// ---- review 2026-11-17 (GPT-Astra-6): findings 1-5 ---------------------------------------------
+srv.SetItems([
+    new SharedItem { Name = "Share", Path = share, IsFolder = true, Upload = UploadAccess.Anyone },
+    new SharedItem { Name = "Private", Path = Path.Combine(share, "sub"), IsFolder = true, Download = Access.Accounts },
+]);
+{
+    var ra = new Authenticator(); ra.SetAccounts([Account.Create("bob", "secret1")]);
+    LoginResult Try(Authenticator a, string user, string pw, string from = "203.0.113.7")
+    {
+        var hc = new Microsoft.AspNetCore.Http.DefaultHttpContext();
+        hc.Request.Headers.Authorization = "Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes(user + ":" + pw));
+        return a.CheckAsync(hc.Request, from, false, default).GetAwaiter().GetResult();
+    }
+    // 1. wrong guesses count everywhere, repeats of the same stale password don't
+    Try(ra, "bob", "guess1"); Try(ra, "bob", "guess2");
+    for (int k = 0; k < 3; k++) Try(ra, "bob", "guess2");
+    Check("R1: distinct wrong guesses counted, stale repeats not", ra.FailureCount("203.0.113.7") == 2, ra.FailureCount("203.0.113.7").ToString());
+    int before = auth.FailureCount("127.0.0.1");
+    var sw = Stopwatch.StartNew();
+    Raw("GET", "/", Basic("bob", "public-guess-1")); Raw("GET", "/Share/a.txt", Basic("bob", "public-guess-2"));
+    Check("R1: wrong passwords on public pages are counted", auth.FailureCount("127.0.0.1") == before + 2, $"{before} -> {auth.FailureCount("127.0.0.1")}");
+    // unknown names cost as much as wrong passwords (no name probing by timing)
+    var t0 = Stopwatch.StartNew(); Try(ra, "nobody-here", "x", "203.0.113.8"); var unknownMs = t0.ElapsedMilliseconds;
+    Check("R7: unknown user name is hashed too", unknownMs >= 15, unknownMs + " ms");
+
+    // 2. a password change wins over checks that were already in flight
+    var rb = new Authenticator(); rb.SetAccounts([Account.Create("bob", "old")]);
+    var inflight = Enumerable.Range(0, 8).Select(k => Task.Run(() => Try(rb, "bob", "old", "203.0.113.9"))).ToArray();
+    Thread.Sleep(5);
+    rb.SetAccounts([Account.Create("bob", "new")]);
+    Task.WaitAll(inflight);
+    Check("R2: old password refused after change (no stale cache)", Try(rb, "bob", "old", "203.0.113.10").Outcome == LoginOutcome.Wrong
+        && Try(rb, "bob", "new", "203.0.113.10").Outcome == LoginOutcome.Ok);
+}
+
+// 3. a file that changes while zipping aborts the archive instead of shipping damaged data
+{
+    var zdir = Path.Combine(root, "zipchange"); Directory.CreateDirectory(zdir);
+    var zf = Path.Combine(zdir, "data.txt");
+    File.WriteAllText(zf, "original data");
+    var plan = ZipPlan.Build(zdir, zdir, default)!;
+    File.WriteAllText(zf, "x");
+    bool threw = false; try { plan.WriteAsync(new MemoryStream(), default).GetAwaiter().GetResult(); } catch (ZipSourceException) { threw = true; }
+    Check("R3: shrunk file aborts the ZIP", threw);
+    File.WriteAllText(zf, "original data");
+    plan = ZipPlan.Build(zdir, zdir, default)!;
+    File.AppendAllText(zf, " plus more");
+    threw = false; try { plan.WriteAsync(new MemoryStream(), default).GetAwaiter().GetResult(); } catch (ZipSourceException) { threw = true; }
+    Check("R3: grown file aborts the ZIP", threw);
+    File.Delete(zf); File.WriteAllText(zf, "stable");
+    plan = ZipPlan.Build(zdir, zdir, default)!;
+    var okZip = new MemoryStream(); plan.WriteAsync(okZip, default).GetAwaiter().GetResult();
+    Check("R3: unchanged folder still zips", okZip.Length == plan.Length);
+}
+
+// 4. a broken upload body is an error, not "200 OK"
+{
+    var bnd = "----broken";
+    var bodyBytes = T($"--{bnd}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"broken.txt\"\r\n\r\nhalf a file without the closing boundary");
+    using var c = new TcpClient("127.0.0.1", port) { ReceiveTimeout = 60000, SendTimeout = 60000 }; var st = c.GetStream();
+    st.Write(T($"POST /Share/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Type: multipart/form-data; boundary={bnd}\r\nContent-Length: {bodyBytes.Length}\r\n\r\n"));
+    st.Write(bodyBytes);
+    var o = new MemoryStream(); st.CopyTo(o); var all = o.ToArray();
+    int code = int.Parse(Encoding.ASCII.GetString(all, 0, 12).Split(' ')[1]);
+    Check("R4: broken multipart -> 400, nothing saved", code == 400 && !File.Exists(Path.Combine(share, "broken.txt")) && NoTemp(root), code.ToString());
+}
+r = Post("/Share/", "", ("", T(""))); Check("R4: no file chosen -> 400", r.code == 400, r.code.ToString());
+
+// 5. HEAD is not a download
+{
+    long d0 = traffic.ReadStats(s => s.Downloads);
+    Logs();
+    Raw("HEAD", "/Share/a.txt"); Raw("HEAD", "/Share/huge.bin"); Thread.Sleep(150);
+    var hl = Logs();
+    Check("R5: HEAD not counted or logged as download", traffic.ReadStats(s => s.Downloads) == d0 && !hl.Any(l => l.Text.Contains("downloaded") || l.Text.StartsWith("Downloading")),
+        string.Join(" | ", hl.Select(l => l.Text)));
+}
+
+// ZIP downloads are capped per address
+{
+    var slow = new List<TcpClient>();
+    for (int k = 0; k < 2; k++)
+    {
+        var c = new TcpClient("127.0.0.1", port) { ReceiveBufferSize = 4096 };
+        c.GetStream().Write(T("GET /Share/?zip HTTP/1.1\r\nHost: x\r\n\r\n"));
+        slow.Add(c);
+    }
+    Thread.Sleep(800);
+    r = Raw("GET", "/Share/?zip");
+    Check("ZIP: third parallel ZIP from one address -> 429", r.code == 429, r.code.ToString());
+    foreach (var c in slow) c.Dispose();
+    Thread.Sleep(500);
+}
 Logs();
 
 srv.SetItems([]);
@@ -408,6 +519,20 @@ try { await srv.StartAsync(port + 1, IPAddress.Loopback); Check("busy port throw
 catch (Exception ex) { Check("busy port throws", true); Console.WriteLine("   -> " + ex.GetType().Name + " / inner " + ex.InnerException?.GetType().Name); }
 blocker.Stop();
 
-Process.Start(new ProcessStartInfo("cmd.exe", $"/c rmdir \"{Path.Combine(share, "link_out")}\" & rmdir \"{Path.Combine(share, "link_in")}\"") { CreateNoWindow = true, UseShellExecute = false })!.WaitForExit();
-Directory.Delete(root, true);
+}
+catch (Exception ex)
+{
+    fails++;
+    Console.WriteLine("FAIL  harness crashed: " + ex);
+}
+finally
+{
+    try { await srv.StopAsync(); } catch { }
+    // junctions first (removing the link, never the target), then our own temp folder
+    foreach (var link in new[] { "link_out", "link_in" })
+        try { var d = new DirectoryInfo(Path.Combine(share, link)); if (d.Exists && d.LinkTarget != null) d.Delete(); } catch { }
+    if (Path.GetFileName(root).StartsWith("mhfs_test_") && root.StartsWith(Path.GetTempPath()))
+        try { Directory.Delete(root, true); } catch (Exception ex) { Console.WriteLine("cleanup: " + ex.Message); }
+}
 Console.WriteLine(fails == 0 ? "ALL PASS" : $"{fails} FAILED");
+return fails == 0 ? 0 : 1;

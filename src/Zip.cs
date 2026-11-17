@@ -5,14 +5,17 @@ using System.Text;
 
 namespace ModernHFS;
 
+/// <summary>A source file changed or became unreadable mid-archive.</summary>
+public sealed class ZipSourceException(string message) : IOException(message);
+
 /// <summary>
 /// A folder streamed as a ZIP. Files are stored as-is (no compression), so the exact archive size is known
 /// before the first byte: the browser shows real progress and time left, nothing is buffered on disk.
 /// ZIP64 is used automatically past 4 GB / 65k entries.
 /// </summary>
-sealed class ZipPlan
+public sealed class ZipPlan
 {
-    public sealed record Item(string Name, string? Path, long Size, DateTime Modified)   // Path null = folder
+    public sealed record Item(string Name, string? Path, long Size, DateTime Modified, DateTime ModifiedUtc)   // Path null = folder
     {
         public bool IsDir => Path == null;
         public readonly byte[] NameBytes = Encoding.UTF8.GetBytes(Name);
@@ -37,8 +40,18 @@ sealed class ZipPlan
         {
             ct.ThrowIfCancellationRequested();
             var (dir, prefix, depth) = todo.Pop();
-            List<FileSystemInfo> entries;
-            try { entries = new DirectoryInfo(dir).EnumerateFileSystemInfos().ToList(); }
+            // Enumerate lazily and stop at the limit: a folder with millions of entries never gets fully materialized.
+            var entries = new List<FileSystemInfo>();
+            try
+            {
+                foreach (var e in new DirectoryInfo(dir).EnumerateFileSystemInfos())
+                {
+                    if (plan.Items.Count + entries.Count > MaxEntries) return null;
+                    if ((entries.Count & 1023) == 0) ct.ThrowIfCancellationRequested();
+                    entries.Add(e);
+                }
+            }
+            catch (OperationCanceledException) { throw; }
             catch { continue; }
             var subdirs = new List<(string, string, int)>();
             foreach (var fsi in entries.OrderBy(e => e.Name, StringComparer.OrdinalIgnoreCase))
@@ -55,14 +68,14 @@ sealed class ZipPlan
                     if ((a & FileAttributes.ReparsePoint) != 0 && FileServer.IsUnder(real, Path.GetFullPath(folder))) continue;
                     // ...and a link pointing back up would loop forever: every real folder only once.
                     if (depth >= 64 || !seen.Add(real)) continue;
-                    plan.Items.Add(new Item(name + "/", null, 0, fsi.LastWriteTime));
+                    plan.Items.Add(new Item(name + "/", null, 0, fsi.LastWriteTime, fsi.LastWriteTimeUtc));
                     subdirs.Add((fsi.FullName, name + "/", depth + 1));
                 }
                 else
                 {
                     long length;
                     try { length = ((FileInfo)fsi).Length; } catch { continue; }
-                    plan.Items.Add(new Item(name, fsi.FullName, length, fsi.LastWriteTime));
+                    plan.Items.Add(new Item(name, fsi.FullName, length, fsi.LastWriteTime, fsi.LastWriteTimeUtc));
                     plan.FileCount++;
                     plan.FileBytes += length;
                 }
@@ -98,8 +111,11 @@ sealed class ZipPlan
         Length = length + 22;
     }
 
-    /// <summary>Writes exactly <see cref="Length"/> bytes. A file that shrank or vanished meanwhile is padded with zeros.</summary>
-    public async Task WriteAsync(Stream output, Action<string> warn, CancellationToken ct)
+    /// <summary>
+    /// Writes exactly <see cref="Length"/> bytes. A file that changed, shrank, vanished or can't be read since the plan
+    /// throws <see cref="ZipSourceException"/>: the caller aborts the download rather than send a damaged archive.
+    /// </summary>
+    public async Task WriteAsync(Stream output, CancellationToken ct)
     {
         var central = new List<(Item Item, long Offset, uint Crc)>(Items.Count);
         var buffer = ArrayPool<byte>.Shared.Rent(256 * 1024);
@@ -117,36 +133,32 @@ sealed class ZipPlan
                 {
                     var hash = new Crc32();
                     long left = item.Size;
+                    FileStream fs;
                     try
                     {
-                        await using var fs = new FileStream(item.Path!, FileMode.Open, FileAccess.Read,
+                        fs = new FileStream(item.Path!, FileMode.Open, FileAccess.Read,
                             FileShare.ReadWrite | FileShare.Delete, 1, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        throw new ZipSourceException($"\"{item.Name}\" can't be read any more ({ex.Message})");
+                    }
+                    await using (fs)
+                    {
                         while (left > 0)
                         {
-                            int n = await fs.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, left)), ct);
-                            if (n == 0) break;
+                            int n;
+                            try { n = await fs.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, left)), ct); }
+                            catch (IOException ex) { throw new ZipSourceException($"reading \"{item.Name}\" failed ({ex.Message})"); }
+                            if (n == 0) throw new ZipSourceException($"\"{item.Name}\" got shorter while zipping");
                             hash.Append(buffer.AsSpan(0, n));
                             await output.WriteAsync(buffer.AsMemory(0, n), ct);
                             left -= n;
                             pos += n;
                         }
-                    }
-                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException && !ct.IsCancellationRequested)
-                    {
-                        // unreadable now (locked, deleted): padded below so the promised size still holds
-                    }
-                    if (left > 0)
-                    {
-                        warn($"\"{item.Name}\" changed or couldn't be read while zipping, the rest is filled with zeros");
-                        Array.Clear(buffer);
-                        while (left > 0)
-                        {
-                            int n = (int)Math.Min(buffer.Length, left);
-                            hash.Append(buffer.AsSpan(0, n));
-                            await output.WriteAsync(buffer.AsMemory(0, n), ct);
-                            left -= n;
-                            pos += n;
-                        }
+                        // grown or rewritten while we read: what we sent may be a mix of old and new
+                        if (fs.Length != item.Size || File.GetLastWriteTimeUtc(item.Path!) != item.ModifiedUtc)
+                            throw new ZipSourceException($"\"{item.Name}\" changed while zipping");
                     }
                     crc = hash.GetCurrentHashAsUInt32();
                     var descriptor = Descriptor(item, crc);

@@ -68,6 +68,14 @@ public sealed class HostNames
     /// <summary>Changes whenever a new name arrives (the UI repaints then).</summary>
     public int Version => Volatile.Read(ref version);
 
+    /// <summary>Drops expired names (and everything, past 20,000 addresses).</summary>
+    public void Prune()
+    {
+        if (cache.Count > 20_000) { cache.Clear(); return; }
+        var now = DateTime.UtcNow;
+        foreach (var kv in cache) if (now - kv.Value.At >= Keep) cache.TryRemove(kv.Key, out _);
+    }
+
     /// <summary>The cached name, or null (and a lookup starts in the background).</summary>
     public string? Get(string address)
     {

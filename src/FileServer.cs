@@ -29,9 +29,12 @@ sealed class PageContext
     public bool ShowFiles = true;
     /// <summary>Per-response CSP nonce for the page's own upload script.</summary>
     public string Nonce = "";
+    /// <summary>The folder had more entries than one page shows.</summary>
+    public bool Truncated;
 }
 
-sealed record UploadResult(string Name, string? SavedAs, long Bytes, string? Error);
+/// <param name="Status">HTTP status this result calls for: 0 = saved, 400 bad input, 500 server-side failure, 507 disk full.</param>
+sealed record UploadResult(string Name, string? SavedAs, long Bytes, string? Error, int Status = 0);
 
 /// <summary>
 /// The web side. URL layout: "/" lists the shared items, "/{item}/sub/path" walks inside a shared folder.
@@ -42,6 +45,7 @@ public sealed class FileServer
     sealed record Snapshot(IReadOnlyList<SharedItem> Order, IReadOnlyDictionary<string, SharedItem> ByName);
 
     sealed class DiskFullException() : IOException("The disk is full");
+    sealed class VisitorBodyException(Exception inner) : Exception("Reading the upload failed", inner);
 
     static readonly FileExtensionContentTypeProvider Types = new();
     static readonly char[] BadChars = Path.GetInvalidFileNameChars();
@@ -53,6 +57,9 @@ public sealed class FileServer
 
     readonly byte[] favicon;
     readonly Traffic traffic;
+    // ZIP downloads read whole folders: a few at a time, at most two per address.
+    readonly SemaphoreSlim zipSlots = new(4, 4);
+    readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> zipsPerAddress = new();
     readonly Authenticator auth;
     volatile Snapshot snap = new([], new Dictionary<string, SharedItem>());
     WebApplication? app;
@@ -136,13 +143,26 @@ public sealed class FileServer
         var res = ctx.Response;
         if (conn != null)
             res.OnStarting(() => { if (!conn.Uploading) conn.Expected = res.ContentLength ?? -1; return Task.CompletedTask; });
+        bool failed = false;
         try
         {
             await HandleAsync(ctx, info, conn, address, path);
         }
+        catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            failed = true;
+            traffic.Log(address, $"Server error on {path}: {ex.GetType().Name}: {ex.Message}", LogKind.Bad);
+            if (!res.HasStarted)
+            {
+                try { res.Clear(); await Html(ctx, Listing.Error(500, "Something went wrong on the server."), 500); }
+                catch { ctx.Abort(); }
+            }
+            else ctx.Abort();
+        }
         finally
         {
-            bool aborted = ctx.RequestAborted.IsCancellationRequested;
+            bool aborted = ctx.RequestAborted.IsCancellationRequested || failed;
             traffic.Finish(address, ctx.Request.Method, path, info, res.StatusCode, aborted, conn, DateTime.Now - started);
             if (conn != null)
             {
@@ -197,7 +217,21 @@ public sealed class FileServer
             return;
         }
 
-        string? user = auth.Check(req, out bool wrongLogin, out string triedName);
+        var login = await auth.CheckAsync(req, address, neverBan: Guard.IsPrivate(ip), ctx.RequestAborted);
+        if (login.Outcome == LoginOutcome.Busy)
+        {
+            res.Headers.RetryAfter = "5";
+            await Html(ctx, Listing.Error(503, "Too many sign-ins at the same moment. Try again in a few seconds."), 503);
+            return;
+        }
+        if (login.Counted)
+        {
+            var tried = login.TriedName.Length > 0 ? $" for \"{(login.TriedName.Length > 40 ? login.TriedName[..40] : login.TriedName)}\"" : "";
+            traffic.Log(address, $"Wrong user name or password{tried}", LogKind.Warn);
+        }
+        if (login.Delay > TimeSpan.Zero)
+            try { await Task.Delay(login.Delay, ctx.RequestAborted); } catch { return; }
+        string? user = login.User;
         var page = new PageContext
         {
             User = user,
@@ -215,11 +249,10 @@ public sealed class FileServer
             {
                 if (user != null)
                 {
-                    auth.Succeeded(address);
                     traffic.Log(address, $"Signed in as {user}", LogKind.Info);
                     Redirect(ctx, SafeReturn(req.Query["login"].ToString()));
                 }
-                else await Challenge(ctx, address, wrongLogin, triedName);
+                else await Challenge(ctx);
                 return;
             }
             info.Listing = true;
@@ -253,7 +286,7 @@ public sealed class FileServer
         page.ShowFiles = canDownload;
         if (!canDownload && page.Upload != UploadState.Allowed)
         {
-            await Challenge(ctx, address, wrongLogin, triedName);
+            await Challenge(ctx);
             return;
         }
 
@@ -283,7 +316,7 @@ public sealed class FileServer
         {
             if (post)
             {
-                if (page.Upload == UploadState.NeedLogin) { await Challenge(ctx, address, wrongLogin, triedName); return; }
+                if (page.Upload == UploadState.NeedLogin) { await Challenge(ctx); return; }
                 if (page.Upload != UploadState.Allowed)
                 {
                     await Html(ctx, Listing.Error(403, "Uploads aren't allowed in this folder."), 403);
@@ -296,7 +329,7 @@ public sealed class FileServer
             if (!slash) { Redirect(ctx, Url(segs) + "/" + KeptQuery(req)); return; }
             if (req.Query.ContainsKey("zip"))
             {
-                if (!canDownload) { await Challenge(ctx, address, wrongLogin, triedName); return; }
+                if (!canDownload) { await Challenge(ctx); return; }
                 await SendZip(ctx, full, root, segs, info, conn, address);
                 return;
             }
@@ -313,7 +346,7 @@ public sealed class FileServer
         if (File.Exists(full))
         {
             if (post) { await MethodNotAllowed(ctx); return; }
-            if (!canDownload) { await Challenge(ctx, address, wrongLogin, triedName); return; }
+            if (!canDownload) { await Challenge(ctx); return; }
             if (slash) { Redirect(ctx, Url(segs) + KeptQuery(req)); return; }
             await SendFile(ctx, full, info, conn, address, logPath);
             return;
@@ -324,17 +357,9 @@ public sealed class FileServer
 
     // ---- sign-in -------------------------------------------------------------------------------
 
-    /// <summary>401 + Basic challenge (the browser shows its sign-in box). Wrong passwords are counted and slowed down.</summary>
-    async Task Challenge(HttpContext ctx, string address, bool wrongLogin, string triedName)
+    /// <summary>401 + Basic challenge (the browser shows its sign-in box). Wrong guesses were already counted in HandleAsync.</summary>
+    async Task Challenge(HttpContext ctx)
     {
-        if (wrongLogin)
-        {
-            var name = triedName.Length > 0 ? $" for \"{(triedName.Length > 40 ? triedName[..40] : triedName)}\"" : "";
-            traffic.Log(address, $"Wrong user name or password{name}", LogKind.Warn);
-            var delay = auth.Fail(address);
-            if (delay > TimeSpan.Zero)
-                try { await Task.Delay(delay, ctx.RequestAborted); } catch { return; }
-        }
         ctx.Response.Headers.WWWAuthenticate = $"Basic realm=\"{Authenticator.Realm}\", charset=\"UTF-8\"";
         await Html(ctx, Listing.Error(401, auth.HasAccounts
             ? "You need an account to open this. Ask the person who shared it."
@@ -403,10 +428,15 @@ public sealed class FileServer
                     : HeaderUtilities.RemoveQuotes(cd.FileName).Value ?? "";
                 if (string.IsNullOrWhiteSpace(raw)) continue;   // a text field or an empty file box
 
+                if (results.Count >= 1000)
+                {
+                    results.Add(new UploadResult(raw, null, 0, "Too many files in one upload (1000 at most)", 400));
+                    break;
+                }
                 var name = SafeUploadName(raw);
                 if (name == null)
                 {
-                    results.Add(new UploadResult(raw, null, 0, "This file name isn't allowed"));
+                    results.Add(new UploadResult(raw, null, 0, "This file name isn't allowed", 400));
                     traffic.Log(address, $"Upload refused: bad name \"{raw}\"", LogKind.Warn);
                     continue;
                 }
@@ -422,30 +452,33 @@ public sealed class FileServer
                 else
                 {
                     traffic.Log(address, $"Upload failed: {folderUrl}{name}: {result.Error}", LogKind.Warn);
-                    if (result.Error.StartsWith("The disk")) { stopped = true; break; }
+                    if (result.Status >= 500) { stopped = result.Status == 507; break; }
                 }
             }
         }
         catch (Exception ex) when (ex is IOException or OperationCanceledException or InvalidDataException)
         {
-            // client went away or sent a broken form; SaveOne already removed the partial file
-            if (ctx.RequestAborted.IsCancellationRequested || ex is not InvalidDataException)
+            // SaveOne already removed the partial file
+            if (ctx.RequestAborted.IsCancellationRequested)
             {
                 traffic.Log(address, $"Upload interrupted in {folderUrl}", LogKind.Warn);
-                return;
+                return;   // the visitor is gone, nobody reads the reply
             }
-            results.Add(new UploadResult("(form)", null, 0, "The upload form data was broken"));
+            // still connected: the form data itself was broken or incomplete
+            results.Add(new UploadResult("(upload)", null, 0, "The upload arrived incomplete or broken, nothing was saved from it", 400));
+            traffic.Log(address, $"Upload to {folderUrl} arrived broken ({Traffic.Clean(ex.Message, 100)})", LogKind.Warn);
         }
 
         info.UploadOk = results.Count > 0 && results.All(r => r.Error == null);
-        int status = results.Any(r => r.Error == null) || results.Count == 0 ? 200 : stopped ? 507 : 400;
+        // 200 only when every file was saved; otherwise the worst problem decides (the upload script reads this).
+        int status = results.Count == 0 ? 400 : info.UploadOk ? 200 : results.Max(r => r.Status == 0 ? 400 : r.Status);
         await Html(ctx, Listing.UploadDone(segs, results, page, stopped), status);
     }
 
     async Task<UploadResult> SaveOne(Stream body, string folder, string name, CancellationToken ct)
     {
         if (FreeSpace(folder) is long free && free < MinFreeBytes)
-            return new UploadResult(name, null, 0, "The disk is full");
+            return new UploadResult(name, null, 0, "The disk is full", 507);
 
         // Write to a hidden temp file in the same folder (never listed or served), rename when complete.
         var temp = Path.Join(folder, $".{Guid.NewGuid():N}.uploading");
@@ -459,15 +492,18 @@ public sealed class FileServer
                 var buffer = ArrayPool<byte>.Shared.Rent(1 << 16);
                 try
                 {
-                    long nextCheck = 64L << 20;
-                    int n;
-                    while ((n = await body.ReadAsync(buffer, ct)) > 0)
+                    long nextCheck = 8L << 20;
+                    while (true)
                     {
+                        int n;
+                        try { n = await body.ReadAsync(buffer, ct); }
+                        catch (Exception ex) when (ex is not OperationCanceledException) { throw new VisitorBodyException(ex); }
+                        if (n == 0) break;
                         await fs.WriteAsync(buffer.AsMemory(0, n), ct);
                         written += n;
                         if (written >= nextCheck)
                         {
-                            nextCheck += 64L << 20;
+                            nextCheck += 8L << 20;   // several uploads at once share the reserve, so look often
                             if (FreeSpace(folder) is long left && left < MinFreeBytes) throw new DiskFullException();
                         }
                     }
@@ -481,17 +517,27 @@ public sealed class FileServer
         catch (DiskFullException)
         {
             TryDelete(temp);
-            return new UploadResult(name, null, written, "The disk is full");
+            return new UploadResult(name, null, written, "The disk is full", 507);
         }
         catch (UnauthorizedAccessException)
         {
             TryDelete(temp);
-            return new UploadResult(name, null, written, "Windows doesn't allow writing to this folder");
+            return new UploadResult(name, null, written, "Windows doesn't allow writing to this folder", 500);
         }
-        catch
+        catch (VisitorBodyException ex)
+        {
+            TryDelete(temp);
+            throw ex.InnerException!;   // the visitor's side: ReceiveUpload decides (gone, or broken form)
+        }
+        catch (OperationCanceledException)
         {
             TryDelete(temp);
             throw;
+        }
+        catch (IOException ex)
+        {
+            TryDelete(temp);
+            return new UploadResult(name, null, written, "The server couldn't save the file: " + Traffic.Clean(ex.Message, 120), 500);
         }
     }
 
@@ -617,7 +663,7 @@ public sealed class FileServer
             info.RangeStart = r.From ?? (r.To is long suffix ? Math.Max(0, fi.Length - suffix) : 0);
         }
         if (conn != null) conn.Status = "Downloading";
-        traffic.FileStarting(address, logPath, info);
+        if (!HttpMethods.IsHead(ctx.Request.Method)) traffic.FileStarting(address, logPath, info);
         if (!Types.TryGetContentType(fi.Name, out var type)) type = "application/octet-stream";
         // Files that a browser could run as a page (html, svg, xml...) are shown sandboxed: no scripts.
         if (type.Contains("html") || type.Contains("xml") || type.Contains("svg") || type.Contains("javascript"))
@@ -630,6 +676,32 @@ public sealed class FileServer
 
     /// <summary>The whole folder as one ZIP, streamed with an exact Content-Length.</summary>
     async Task SendZip(HttpContext ctx, string full, string root, string[] segs, RequestInfo info, Conn? conn, string address)
+    {
+        if (zipsPerAddress.AddOrUpdate(address, 1, (_, n) => n + 1) > 2)
+        {
+            ReleaseZip(address, slot: false);
+            ctx.Response.Headers.RetryAfter = "30";
+            await Html(ctx, Listing.Error(429, "You already have two ZIP downloads running. Let one finish first."), 429);
+            return;
+        }
+        if (!zipSlots.Wait(0))
+        {
+            ReleaseZip(address, slot: false);
+            ctx.Response.Headers.RetryAfter = "60";
+            await Html(ctx, Listing.Error(503, "Several ZIP downloads are already running. Try again in a few minutes."), 503);
+            return;
+        }
+        try { await SendZipCore(ctx, full, root, segs, info, conn, address); }
+        finally { ReleaseZip(address, slot: true); }
+    }
+
+    void ReleaseZip(string address, bool slot)
+    {
+        if (slot) zipSlots.Release();
+        if (zipsPerAddress.AddOrUpdate(address, 0, (_, n) => n - 1) <= 0) zipsPerAddress.TryRemove(address, out _);
+    }
+
+    async Task SendZipCore(HttpContext ctx, string full, string root, string[] segs, RequestInfo info, Conn? conn, string address)
     {
         ZipPlan? plan;
         try { plan = await Task.Run(() => ZipPlan.Build(full, root, ctx.RequestAborted)); }
@@ -644,7 +716,7 @@ public sealed class FileServer
         info.Length = plan.Length;
         info.LogName = Url(segs) + "/ as ZIP";
         if (conn != null) { conn.Status = "Downloading"; conn.File = info.LogName; }
-        traffic.FileStarting(address, info.LogName, info);
+        if (!HttpMethods.IsHead(ctx.Request.Method)) traffic.FileStarting(address, info.LogName, info);
 
         var res = ctx.Response;
         res.ContentType = "application/zip";
@@ -657,7 +729,13 @@ public sealed class FileServer
         if (HttpMethods.IsHead(ctx.Request.Method)) return;
         try
         {
-            await plan.WriteAsync(res.Body, warning => traffic.Log(address, warning, LogKind.Warn), ctx.RequestAborted);
+            await plan.WriteAsync(res.Body, ctx.RequestAborted);
+        }
+        catch (ZipSourceException ex)
+        {
+            // Better a download that visibly fails than a ZIP holding a damaged file with a valid checksum.
+            traffic.Log(address, $"ZIP of {info.LogName} stopped: {ex.Message}", LogKind.Bad);
+            ctx.Abort();
         }
         catch (Exception ex) when (ex is OperationCanceledException or IOException) { }   // visitor went away
     }

@@ -518,6 +518,8 @@ sealed class MainForm : Form
         {
             traffic.SaveStats();
             traffic.Guard.Prune();
+            auth.Prune();
+            hosts.Prune();
             ExpireBans();
         }
         UpdateTrayText();
@@ -779,6 +781,7 @@ sealed class MainForm : Form
         foreach (var b in gone)
         {
             traffic.Guard.Forget(b.Pattern);
+            auth.Forget(b.Pattern);
             traffic.Log(b.Pattern, "Auto-ban expired", LogKind.Info);
         }
         if (sideCard.Tab == 2) RefreshBans();
@@ -829,6 +832,7 @@ sealed class MainForm : Form
         foreach (var n in names)
         {
             traffic.Guard.Forget(n);
+            auth.Forget(n);
             traffic.Log(n, "Unbanned", LogKind.Info);
         }
         RefreshBans();
@@ -1513,7 +1517,7 @@ sealed class MainForm : Form
         NetworkChange.NetworkAddressChanged -= OnNetworkChanged;
         tray.Visible = false;
         try { Task.Run(server.StopAsync).Wait(3000); } catch { }
-        traffic.SaveStats();
+        traffic.SaveStats(wait: true);
         base.OnFormClosing(e);
     }
 

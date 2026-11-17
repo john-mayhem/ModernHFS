@@ -40,8 +40,14 @@ static class Listing
     {
         var list = new List<Entry>();
         if (!page.ShowFiles) return Render(segs, list, q, isRoot: false, page, 0);   // drop box: upload only
+        // Huge folders: the filter is applied while reading and the page stops at MaxRows, so the work stays bounded.
+        string filter = q["q"].ToString().Trim();
+        if (filter.Length > 100) filter = filter[..100];
+        bool more = false;
         foreach (var fsi in new DirectoryInfo(full).EnumerateFileSystemInfos())
         {
+            if (filter.Length > 0 && !fsi.Name.Contains(filter, StringComparison.OrdinalIgnoreCase)) continue;
+            if (list.Count >= MaxRows) { more = true; break; }
             FileAttributes a;
             try { a = fsi.Attributes; } catch { continue; }
             if (!FileServer.Visible(a)) continue;
@@ -51,8 +57,11 @@ static class Listing
             if (!dir) { try { size = ((FileInfo)fsi).Length; } catch { continue; } }
             list.Add(new(fsi.Name, dir, size, fsi.LastWriteTime));
         }
+        page.Truncated = more;
         return Render(segs, list, q, isRoot: false, page, 0);
     }
+
+    const int MaxRows = 10_000;
 
     // ---- pages ---------------------------------------------------------------------------------
 
@@ -100,6 +109,9 @@ static class Listing
             return sb.ToString();
         }
 
+        if (page.Truncated)
+            sb.Append("<p class=\"filtered\">This folder is very large: showing the first ").Append(MaxRows.ToString("N0", CultureInfo.InvariantCulture))
+              .Append(" entries. Use the filter to find the rest.</p>");
         if (filter.Length > 0)
             sb.Append("<p class=\"filtered\">").Append(Plural(list.Count, "match")).Append(" for &ldquo;").Append(H(filter))
               .Append("&rdquo; &middot; <a href=\"").Append(SortHref(sort, rev, "")).Append("\">Show everything</a></p>");
@@ -192,7 +204,11 @@ static class Listing
     public static string Error(int code, string message)
     {
         var sb = new StringBuilder();
-        string title = code switch { 404 => "Not found", 401 => "Sign in needed", 403 => "Not allowed", 405 => "Not allowed", _ => "Something went wrong" };
+        string title = code switch
+        {
+            404 => "Not found", 401 => "Sign in needed", 403 or 405 => "Not allowed", 413 => "Too many files",
+            429 or 503 => "Busy right now", _ => "Something went wrong",
+        };
         Head(sb, title, null);
         sb.Append("<div class=\"msg\"><div class=\"code\">").Append(code).Append("</div><h1>").Append(title).Append("</h1><p>")
           .Append(H(message)).Append("</p><p><a class=\"btn ghost\" href=\"/\">Go to the shared files</a></p></div>");
