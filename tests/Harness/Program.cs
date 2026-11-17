@@ -293,7 +293,7 @@ Raw("GET", "/Share/%0aFAKE%20LINE"); Raw("GET", "/nope%E2%80%AEtxt.exe"); Thread
 Check("log lines can't be forged", logs.Count >= 2 && logs.All(l => !l.Text.Any(char.IsControl) && !l.Text.Contains('\u202E')), string.Join(" | ", logs.Select(l => l.Text)));
 r = Post("/Share/", "", ("photo\u202Egpj.exe", T("P")));
 Check("upload name: direction marks stripped", File.Exists(Path.Combine(share, "photogpj.exe")), string.Join(",", Directory.GetFiles(share).Select(Path.GetFileName)));
-Check("IsPrivate", Guard.IsPrivate(IPAddress.Parse("192.168.18.5")) && Guard.IsPrivate(IPAddress.Parse("10.1.2.3")) && Guard.IsPrivate(IPAddress.Parse("172.20.0.1"))
+Check("IsPrivate", Guard.IsPrivate(IPAddress.Parse("192.168.1.5")) && Guard.IsPrivate(IPAddress.Parse("10.1.2.3")) && Guard.IsPrivate(IPAddress.Parse("172.20.0.1"))
     && Guard.IsPrivate(IPAddress.Loopback) && !Guard.IsPrivate(IPAddress.Parse("8.8.8.8")) && !Guard.IsPrivate(IPAddress.Parse("172.32.0.1")));
 Check("traps", Guard.IsTrap(["wp-login.php"]) && Guard.IsTrap([".env"]) && Guard.IsTrap(["x", "shell.php"]) && !Guard.IsTrap(["Movies"]) && !Guard.IsTrap(["song.flac"]));
 
@@ -391,7 +391,7 @@ var hn = new HostNames();
 hn.Get("127.0.0.1"); hn.Get("8.8.8.8");
 for (int k = 0; k < 50 && (hn.Get("127.0.0.1") == null || hn.Get("8.8.8.8") == null); k++) Thread.Sleep(100);
 Check("host names: loopback + reverse DNS", hn.Get("127.0.0.1") == "this PC" && (hn.Get("8.8.8.8") ?? "").Contains("google"), $"{hn.Get("127.0.0.1")} / {hn.Get("8.8.8.8")}");
-Check("adapters listed", Network.Adapters().Any(a => a.Address == "192.168.18.13"), string.Join(",", Network.Adapters().Select(a => a.Name + "=" + a.Address)));
+Check("adapters listed", Network.Adapters().Count > 0 && Network.Adapters().All(a => IPAddress.TryParse(a.Address, out _)), string.Join(",", Network.Adapters().Select(a => a.Name + "=" + a.Address)));
 var pub = Network.PublicIPv4Async().GetAwaiter().GetResult();
 Check("public IPv4 found", pub != null && !Guard.IsPrivate(IPAddress.Parse(pub)), pub ?? "null");
 Logs();
