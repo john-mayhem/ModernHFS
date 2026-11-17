@@ -75,4 +75,4 @@ Open question: how old the "older machines" are (decides how plain the visitor H
 normalizes `..` and can't test traversal): downloads/resume, ~25 traversal/ADS/junction attacks, log/progress/kick/ban,
 sign-in/permissions/uploads/drop box/auto-ban, bot guard + CSRF + header tricks, ZIP (byte-identical + tar + ZIP64),
 host names, adapters, public IP. Run: `cd tests\Harness && dotnet run` (needs Internet for the DNS/public-IP checks;
-creates and deletes its own temp folders). `dotnet run -- ico <path>` regenerates `srcpp.ico`.
+creates and deletes its own temp folders). `dotnet run -- ico <path>` regenerates `src\app.ico`.
